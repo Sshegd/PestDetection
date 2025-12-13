@@ -794,11 +794,13 @@ def assess_weather_risk(weather_json: Dict[str, Any]) -> Dict[str, float]:
 # Firebase helpers
 # -------------------------
 def read_user(uid: str) -> Optional[Dict[str, Any]]:
-    root = db.reference("/")
-    data = root.get()
-    if not data:
+    try:
+        ref = db.reference(f"Users/{uid}")
+        return ref.get()
+    except Exception as e:
+        print("Firebase read error:", e)
         return None
-    return data.get(uid)
+
 
 
 def store_alert(uid: str, alert: Dict[str, Any]) -> str:
@@ -1245,4 +1247,5 @@ def get_alerts(uid: str, lang: str = "en"):
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
 
