@@ -653,17 +653,7 @@ if ML_MODEL_PATH and joblib:
         print("Could not load model:", e)
         ML_MODEL = None
 
-# -------------------------
-# Pydantic models
-# -------------------------
-class PestReport(BaseModel):
-    reportId: str
-    district: str
-    crop: str
-    pest: Optional[str] = None
-    symptoms: Optional[str] = None
-    confidence: Optional[float] = 1.0
-    reportDate: Optional[str] = None
+
 # -------------------------
 # Utility helpers
 # -------------------------
@@ -794,11 +784,16 @@ def assess_weather_risk(weather_json: Dict[str, Any]) -> Dict[str, float]:
 # Firebase helpers
 # -------------------------
 def read_user(uid: str) -> Optional[Dict[str, Any]]:
-    root = db.reference("/")
-    data = root.get()
-    if not data:
+    """
+    Read user data from Firebase under Users/<uid>
+    """
+    try:
+        ref = db.reference(f"Users/{uid}")
+        return ref.get()
+    except Exception as e:
+        print("Firebase read error:", e)
         return None
-    return data.get(uid)
+
 
 
 def store_alert(uid: str, alert: Dict[str, Any]) -> str:
@@ -806,6 +801,7 @@ def store_alert(uid: str, alert: Dict[str, Any]) -> str:
     aid = f"alert_{now_ts_ms()}"
     ref.child(aid).set(alert)
     return aid
+
 
 
 def send_fcm(fcm_token: str, title: str, body: str):
@@ -1128,4 +1124,5 @@ def get_alerts(uid: str, lang: str = "en"):
 
 @app.get("/health")
 def health():
+
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
