@@ -819,6 +819,32 @@ def send_fcm(fcm_token: str, title: str, body: str):
         # don't fail whole operation on push error; log it
         print("FCM send error:", e)
 
+def get_district_breakdown(district: str, crop_name: str) -> List[Dict[str, Any]]:
+    """
+    Returns disease breakdown for a crop in a district based on historical data
+    """
+    month = month_name[datetime.utcnow().month].lower()
+    district = normalize_text(district)
+    crop = normalize_text(crop_name)
+
+    breakdown = []
+
+    district_data = PEST_HISTORY.get(district, {})
+    crop_data = district_data.get(crop, {})
+
+    for pest, months in crop_data.items():
+        if month in months:
+            pest_info = PEST_DB.get(pest, {})
+
+            breakdown.append({
+                "pest": pest,
+                "severity": pest_info.get("severity", "moderate"),
+                "activeMonth": month,
+                "symptoms": pest_info.get("symptoms", []),
+                "preventive": pest_info.get("preventive", DEFAULT_PREVENTIVE)
+            })
+
+    return breakdown
 
 # -------------------------
 # OUTBREAK ALERT (NEW)
@@ -1202,7 +1228,7 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
                     preventive = pval.get("preventive", preventive)
                     corrective = pval.get("corrective", corrective)
                     break
-
+        district_breakdown = get_district_breakdown(district, crop_name)
         alert = {
             "uid": uid,
             "cropKey": crop_key,
@@ -1219,22 +1245,28 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
             "correctiveMeasures": corrective,
             "mlProbability": ml_prob,
             "weatherDelta": weather_assessment.get("delta", 0.0)
+            "districtBreakdown": district_breakdown
         }
 
         aid = store_alert(uid, alert)
         alerts_created.append(alert)
+        
 
-    # =========================================
-    # 🆕 DISTRICT DISEASE BREAKDOWN (STATIC DATA)
-    # ========================================= 
-    district_disease_alerts = generate_district_disease_alerts(
-        uid=uid,
-        district=district,
-        crop_name=crop_name
-    )
-    for da in district_disease_alerts:
-        alerts_created.append(da)
+        if severity == "low":
+            outbreak_alert = generate_district_outbreak_alert(
+                uid=uid,
+                crop_name=crop_name,
+                district_reports=district_reports
+        )
+        if outbreak_alert:
+            alerts_created.append(outbreak_alert)
 
+    final_alerts = deduplicate_by_crop(alerts_created)
+    db.reference(f"alerts/{uid}").delete()    
+    stored = []
+    for alert in final_alerts:
+        aid = store_alert(uid, alert)
+        stored.append({**alert, "alertId": aid})
     return {"status": "ok", "created": alerts_created}
 
 @app.get("/alerts/{uid}")
@@ -1277,3 +1309,4 @@ def get_alerts(uid: str, lang: str = "en"):
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
