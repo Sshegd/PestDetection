@@ -983,6 +983,36 @@ def ingest_report(report: PestReport):
     pr_ref.child(report.reportId).set(payload)
     return {"status": "ok", "reportId": report.reportId}
 
+def deduplicate_by_crop(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Keep only one alert per crop.
+    Priority:
+      1. Higher severity
+      2. Higher riskScore
+      3. Latest timestamp
+    """
+    priority = {"high": 3, "moderate": 2, "low": 1}
+    result = {}
+
+    for alert in alerts:
+        crop = alert.get("cropName")
+        if not crop:
+            continue
+
+        if crop not in result:
+            result[crop] = alert
+        else:
+            old = result[crop]
+
+            if priority.get(alert["severity"], 0) > priority.get(old["severity"], 0):
+                result[crop] = alert
+            elif alert.get("riskScore", 0) > old.get("riskScore", 0):
+                result[crop] = alert
+            elif alert.get("timestamp", 0) > old.get("timestamp", 0):
+                result[crop] = alert
+
+    return list(result.values())
+
 @app.post("/scan/farmer/{uid}")
 def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
     """
@@ -1131,7 +1161,8 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
         }
 
         aid = store_alert(uid, alert)
-        alerts_created.append({**alert, "alertId": aid})
+        alerts_created.append(alert)
+
 
         # ===============================
         # 🆕 DISTRICT OUTBREAK CHECK
