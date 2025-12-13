@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
+
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -857,6 +858,66 @@ def generate_district_outbreak_alert(
             }
     return None
 
+def current_month():
+    return month_name[datetime.utcnow().month]
+
+
+def generate_district_disease_alerts(
+    uid: str,
+    district: str,
+    crop_name: str
+) -> List[Dict[str, Any]]:
+    """
+    Generate district-wise disease breakdown alerts using static pest history
+    """
+    district = normalize_text(district)
+    crop = normalize_text(crop_name)
+    month = current_month()
+
+    alerts = []
+
+    if district not in PEST_HISTORY:
+        return alerts
+
+    if crop not in PEST_HISTORY[district]:
+        return alerts
+
+    for disease, meta in PEST_HISTORY[district][crop].items():
+
+        # Check seasonality
+        if month not in meta.get("season", []):
+            continue
+
+        disease_info = PEST_DB.get(crop, {}).get(disease, {})
+
+        risk_level = meta.get("risk_level", "MEDIUM")
+
+        risk_score = (
+            0.3 if risk_level == "LOW"
+            else 0.5 if risk_level == "MEDIUM"
+            else 0.7
+        )
+
+        alerts.append({
+            "uid": uid,
+            "cropName": crop_name,
+            "timestamp": now_ts_ms(),
+            "alertType": "district_disease_breakdown",
+            "triggerPest": disease,
+            "severity": risk_level.lower(),
+            "complexityLevel": "simple",
+            "riskScore": risk_score,
+            "reasons": [
+                f"{disease.replace('_',' ').title()} reported in {district.title()} during {month}",
+                f"District risk level: {risk_level}"
+            ],
+            "symptoms": disease_info.get("symptoms", []),
+            "preventiveMeasures": disease_info.get("preventive", []),
+            "correctiveMeasures": disease_info.get("corrective", [])
+        })
+
+    return alerts
+
 
 # -------------------------
 # Risk computation (rule + ML + synonyms + weather)
@@ -1064,10 +1125,10 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
         crop_name = None
         if isinstance(logs, dict):
             # logs normally has nested entries; try to find cropName
-            for k, v in logs.items():
+            for _, v in logs.items():
                 if isinstance(v, dict) and v.get("cropName"):
                     crop_name = v.get("cropName")
-                    continue
+                    break
             # if top-level mapping had cropName (rare), use it
             if not crop_name and logs.get("cropName"):
                 crop_name = logs.get("cropName")
@@ -1163,31 +1224,16 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
         aid = store_alert(uid, alert)
         alerts_created.append(alert)
 
-
-        # ===============================
-        # 🆕 DISTRICT OUTBREAK CHECK
-        # ===============================
-        if severity == "low":
-            outbreak_alert = generate_district_outbreak_alert(
-                uid=uid,
-                crop_name=crop_name,
-                district_reports=district_reports
-            )
-
-        if outbreak_alert:
-            outbreak_id = store_alert(uid, outbreak_alert)
-            alerts_created.append({
-                **outbreak_alert,
-                "alertId": outbreak_id
-            })
-        # push notification
-        if send_push and fcm_token:
-            title = f"Pest Alert: {crop_name} ({severity})"
-            body = f"Risk {round(final_score*100)}% • Complexity: {complexity}"
-            try:
-                send_fcm(fcm_token, title, body)
-            except Exception as e:
-                print("Push error:", e)
+    # =========================================
+    # 🆕 DISTRICT DISEASE BREAKDOWN (STATIC DATA)
+    # ========================================= 
+    district_disease_alerts = generate_district_disease_alerts(
+        uid=uid,
+        district=district,
+        crop_name=crop_name
+    )
+    for da in district_disease_alerts:
+        alerts_created.append(da)
 
     return {"status": "ok", "created": alerts_created}
 
