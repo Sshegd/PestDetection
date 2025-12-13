@@ -1190,22 +1190,21 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
                 send_fcm(fcm_token, title, body)
             except Exception as e:
                 print("Push error:", e)
-
-        # ==========================
-        # 🔥 DEDUPLICATE PER CROP
-        # ==========================
-        final_alerts = deduplicate_by_crop(alerts_created)
     
-        # Clear old alerts for user
-        db.reference(f"alerts/{uid}").delete()
 
-        stored_alerts = []
-        for alert in final_alerts:
-            aid = store_alert(uid, alert)
-            stored_alerts.append({**alert, "alertId": aid})
+    # AFTER for crop_key, logs in farm_logs.items():
 
+    final_alerts = deduplicate_by_crop(alerts_created)
 
-    return {"status": "ok", "created": alerts_created}
+    db.reference(f"alerts/{uid}").delete()
+
+    stored_alerts = []
+    for alert in final_alerts:
+        aid = store_alert(uid, alert)
+        stored_alerts.append({**alert, "alertId": aid})
+
+    return {"status": "ok", "created": stored_alerts}
+
 
 @app.get("/alerts/{uid}")
 def get_alerts(uid: str, lang: str = "en"):
@@ -1247,5 +1246,6 @@ def get_alerts(uid: str, lang: str = "en"):
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
 
 
