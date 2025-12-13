@@ -794,12 +794,23 @@ def assess_weather_risk(weather_json: Dict[str, Any]) -> Dict[str, float]:
 # -------------------------
 # Firebase helpers
 # -------------------------
-def read_user(uid: str) -> Optional[Dict[str, Any]]:
-    root = db.reference("/")
-    data = root.get()
-    if not data:
-        return None
-    return data.get(uid)
+def read_user(uid: str):
+    return db.reference(f"Users/{uid}").get()
+
+def get_user_crops(user: dict) -> List[str]:
+    crops = []
+
+    crop_data = user.get("crops", {})
+
+    primary = crop_data.get("primary")
+    if isinstance(primary, dict) and primary.get("cropName"):
+        crops.append(primary["cropName"])
+
+    secondary = crop_data.get("secondary")
+    if isinstance(secondary, dict) and secondary.get("cropName"):
+        crops.append(secondary["cropName"])
+
+    return list(set(crops))  # remove duplicates safely
 
 
 def store_alert(uid: str, alert: Dict[str, Any]) -> str:
@@ -1103,6 +1114,9 @@ def deduplicate_by_crop(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 @app.post("/scan/farmer/{uid}")
 def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
 
+    # ----------------------------
+    # 1. READ USER
+    # ----------------------------
     user = read_user(uid)
     if not user:
         raise HTTPException(status_code=404, detail="Farmer not found")
@@ -1111,84 +1125,127 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
     if not district:
         raise HTTPException(status_code=400, detail="Farmer district missing")
 
-    farm_logs = user.get("farmActivityLogs", {}) or {}
-    district_reports = []
+    # ----------------------------
+    # 2. GET PRIMARY + SECONDARY CROPS
+    # ----------------------------
+    crop_list = get_user_crops(user)
+    if not crop_list:
+        raise HTTPException(status_code=400, detail="No crops found for farmer")
 
-    # Load official reports
+    farm_logs = user.get("farmActivityLogs", {}) or {}
+
+    # ----------------------------
+    # 3. LOAD DISTRICT REPORTS
+    # ----------------------------
+    district_reports = []
     pr_ref = db.reference("pest_reports")
     all_reports = pr_ref.get() or {}
+
     cutoff = datetime.utcnow() - timedelta(days=LOOKBACK_DAYS)
 
     for r in all_reports.values():
         rdate = parse_iso_date(r.get("reportDate"))
-        if rdate and rdate >= cutoff and normalize_text(r.get("district")) == normalize_text(district):
+        if (
+            rdate
+            and rdate >= cutoff
+            and normalize_text(r.get("district")) == normalize_text(district)
+        ):
             district_reports.append(r)
 
+    # ----------------------------
+    # 4. WEATHER ASSESSMENT
+    # ----------------------------
     weather_json = fetch_weather_for_district(district)
-    weather_assessment = assess_weather_risk(weather_json) if weather_json else {"delta": 0.0, "reasons": []}
+    weather_assessment = (
+        assess_weather_risk(weather_json)
+        if weather_json
+        else {"delta": 0.0, "reasons": []}
+    )
 
     alerts_created = []
 
-    for crop_key, logs in farm_logs.items():
+    # =====================================================
+    # 5. 🔥 LOOP **PER CROP**, NOT PER LOG
+    # =====================================================
+    for crop_name in crop_list:
 
-        crop_name = None
-        if isinstance(logs, dict):
-            for v in logs.values():
-                if isinstance(v, dict) and v.get("cropName"):
-                    crop_name = v.get("cropName")
-                    break
-            if not crop_name:
-                crop_name = logs.get("cropName")
+        # collect logs only for this crop
+        crop_logs = {
+            k: v
+            for k, v in farm_logs.items()
+            if isinstance(v, dict) and v.get("cropName") == crop_name
+        }
 
-        if not crop_name:
-            continue
-
-        rule_res = compute_rule_score(crop_name, logs, district_reports)
+        # ----------------------------
+        # RULE ENGINE
+        # ----------------------------
+        rule_res = compute_rule_score(crop_name, crop_logs, district_reports)
         rule_score = min(1.0, rule_res["score"] + weather_assessment["delta"])
 
-        final_score = rule_score
-        severity = classify_severity(final_score)
-        complexity = classify_complexity(final_score, rule_res["symptom_count"], len(district_reports))
+        severity = classify_severity(rule_score)
+        complexity = classify_complexity(
+            rule_score,
+            rule_res.get("symptom_count", 0),
+            len(district_reports),
+        )
 
-        trigger_pest = rule_res["triggered"][0] if rule_res["triggered"] else "unknown"
+        trigger_pest = (
+            rule_res["triggered"][0]
+            if rule_res.get("triggered")
+            else "unknown"
+        )
 
-        preventive, corrective = DEFAULT_PREVENTIVE, DEFAULT_CORRECTIVE
+        # ----------------------------
+        # MEASURES
+        # ----------------------------
+        preventive = DEFAULT_PREVENTIVE
+        corrective = DEFAULT_CORRECTIVE
+
         crop_db = CROP_DB.get(crop_name.lower(), {})
         if trigger_pest in crop_db:
             preventive = crop_db[trigger_pest].get("preventive", preventive)
             corrective = crop_db[trigger_pest].get("corrective", corrective)
 
-        district_breakdown = get_district_breakdown(district, crop_name) or []
+        # ----------------------------
+        # 🆕 DISTRICT DISEASE BREAKDOWN
+        # ----------------------------
+        district_breakdown = get_district_breakdown(district, crop_name)
 
+        # ----------------------------
+        # ALERT OBJECT (ONE PER CROP)
+        # ----------------------------
         alert = {
             "uid": uid,
-            "cropKey": crop_key,
             "cropName": crop_name,
             "timestamp": now_ts_ms(),
-            "riskScore": round(final_score, 3),
+            "alertType": "scan_result",
+            "riskScore": round(rule_score, 3),
             "severity": severity,
             "complexityLevel": complexity,
             "triggerPest": trigger_pest,
             "reasons": rule_res["reasons"] + weather_assessment["reasons"],
             "preventiveMeasures": preventive,
             "correctiveMeasures": corrective,
-            "districtBreakdown": district_breakdown
+            "districtBreakdown": district_breakdown,
         }
 
         alerts_created.append(alert)
 
-    # 🔥 DEDUPLICATE ONCE
-    final_alerts = deduplicate_by_crop(alerts_created)
-
-    # 🔥 CLEAR + STORE ONCE
+    # =====================================================
+    # 6. CLEAR OLD ALERTS + STORE NEW ONES
+    # =====================================================
     db.reference(f"alerts/{uid}").delete()
 
     stored = []
-    for alert in final_alerts:
+    for alert in alerts_created:
         aid = store_alert(uid, alert)
         stored.append({**alert, "alertId": aid})
 
-    return {"status": "ok", "created": stored}
+    return {
+        "status": "ok",
+        "totalCrops": len(stored),
+        "alerts": stored,
+    }
 
 @app.get("/alerts/{uid}")
 def get_alerts(uid: str, lang: str = "en"):
@@ -1230,6 +1287,7 @@ def get_alerts(uid: str, lang: str = "en"):
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
 
 
 
