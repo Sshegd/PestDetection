@@ -794,13 +794,11 @@ def assess_weather_risk(weather_json: Dict[str, Any]) -> Dict[str, float]:
 # Firebase helpers
 # -------------------------
 def read_user(uid: str) -> Optional[Dict[str, Any]]:
-    try:
-        ref = db.reference(f"Users/{uid}")
-        return ref.get()
-    except Exception as e:
-        print("Firebase read error:", e)
+    root = db.reference("/")
+    data = root.get()
+    if not data:
         return None
-
+    return data.get(uid)
 
 
 def store_alert(uid: str, alert: Dict[str, Any]) -> str:
@@ -1069,7 +1067,7 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
             for k, v in logs.items():
                 if isinstance(v, dict) and v.get("cropName"):
                     crop_name = v.get("cropName")
-                    break
+                    continue
             # if top-level mapping had cropName (rare), use it
             if not crop_name and logs.get("cropName"):
                 crop_name = logs.get("cropName")
@@ -1190,21 +1188,8 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
                 send_fcm(fcm_token, title, body)
             except Exception as e:
                 print("Push error:", e)
-    
 
-    # AFTER for crop_key, logs in farm_logs.items():
-
-    final_alerts = deduplicate_by_crop(alerts_created)
-
-    db.reference(f"alerts/{uid}").delete()
-
-    stored_alerts = []
-    for alert in final_alerts:
-        aid = store_alert(uid, alert)
-        stored_alerts.append({**alert, "alertId": aid})
-
-    return {"status": "ok", "created": stored_alerts}
-
+    return {"status": "ok", "created": alerts_created}
 
 @app.get("/alerts/{uid}")
 def get_alerts(uid: str, lang: str = "en"):
@@ -1246,6 +1231,3 @@ def get_alerts(uid: str, lang: str = "en"):
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
-
-
-
