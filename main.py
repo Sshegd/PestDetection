@@ -2,815 +2,43 @@
 import os
 import json
 import time
-from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from datetime import datetime
+from typing import Dict, Any, Optional, List
 
-
-import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 import firebase_admin
-from firebase_admin import credentials, db, messaging
+from firebase_admin import credentials, db
 
-try:
-    import joblib
-except Exception:
-    joblib = None
+from pest_engine import PestEngine
+from pest_db import PEST_DB
+from district_pest_history import PEST_HISTORY
 
-# -------------------------
-# Config / Env
-# -------------------------
 FIREBASE_CREDS = os.environ.get("FIREBASE_CREDENTIALS")
 FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL")
-WEATHER_API_URL = os.environ.get("WEATHER_API_URL")  # Provider endpoint (e.g. Open-Meteo)
-WEATHER_API_KEY = os.environ.get("WEATHER_API_KEY")  # optional
-ML_MODEL_PATH = os.environ.get("ML_MODEL_PATH")     # optional (joblib model)
 
 if not FIREBASE_CREDS or not FIREBASE_DB_URL:
-    raise RuntimeError("Set FIREBASE_CREDENTIALS and FIREBASE_DB_URL environment variables")
+    raise RuntimeError("Firebase env vars missing")
 
 cred = credentials.Certificate(json.loads(FIREBASE_CREDS))
-firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
+firebase_admin.initialize_app(cred, {
+    "databaseURL": FIREBASE_DB_URL
+})
 
-app = FastAPI(title="Pest Detection + Synonyms + Kannada + ML + Weather", version="1.0")
+app = FastAPI(title="KrishiSakhi Pest Detection API")
 
-LOOKBACK_DAYS = 14
-# -----------------------------------------------------
-# Render-Compatible Firebase Initialization
-# -----------------------------------------------------
-# -------------------------
-# District -> lat/lon mapping (add more as needed)
-# Use approximate coordinates for district HQs / representative locations.
-# -------------------------
-DISTRICT_COORDS = {
-    "uttara kannada": {"lat": 14.6167, "lon": 74.5833},  # Karwar area
-    "shimoga": {"lat": 13.9299, "lon": 75.5681},        # Shivamogga
-    "dharwad": {"lat": 15.4589, "lon": 75.0078},
-    "mysuru": {"lat": 12.2958, "lon": 76.6394},
-    "bangalore rural": {"lat": 12.9538, "lon": 77.3500},
-    "udupi": {"lat": 13.3409, "lon": 74.7421},
-    # add your districts...
-}# -----------------------------------------------------
-# -------------------------
-# Pest synonyms (eng -> list of synonyms incl. Kannada names)
-# Extend as you learn local names. Use lowercase.
-# -------------------------
-# -------------------------
-# Kannada translations for common keys & messages (extend as needed)
-# -------------------------
-KANANDA_TRANSLATIONS = {
-    # keys
-    "riskScore": "ರಿಸ್ಕ್ ಸ್ಕೋರ್",
-    "severity": "ತೀವ್ರತೆ",
-    "complexityLevel": "ಸಂಕೀರ್ಣತೆ ಮಟ್ಟ",
-    "preventiveMeasures": "ರಕ್ಷಕ ಕ್ರಮಗಳು",
-    "correctiveMeasures": "ಶಿಕ್ಷಣಾತ್ಮಕ ಕ್ರಮಗಳು",
-    "triggerPest": "ಪ್ರೇರಣ ಕೀಟ/ರೋಗ",
-    "reasons": "ಕಾರಣಗಳು",
-    # severity values
-    "low": "ಕಡಿಮೆ",
-    "moderate": "ಮಧ್ಯಮ",
-    "high": "ಹೆಚ್ಚು",
-    # complexity
-    "simple": "ಸಾದಾ",
-    "moderate": "ಮಧ್ಯಮ",
-    "complex": "ಸಂಕೀರ್ಣ",
-    "critical": "ಗಂಭೀರ",
-    # measures (examples — these will be reused, translated where straightforward)
-    "Scout fields daily": "ಪ್ರತಿ ದಿನ ಕ್ಷೇತ್ರವನ್ನು ತಪಾಸಣೆ ಮಾಡಿ",
-    "Maintain hygiene": "ಶುದ್ಧತೆ ಯನ್ನು ಕಾಯ್ದುಕೊಳ್ಳಿ",
-    "Use IPM": "IPM ವಿಧಾನಗಳನ್ನು ಉಪಯೋಗಿಸಿ",
-    "Consult extension officer": "ವಿಸ್ತರಣಾ ಅಧಿಕಾರಿಗೆ ಸಂಪರ್ಕಿಸಿ",
-    "Use approved inputs only": "ಹೇಷಿದ ಪರಿಕರಗಳನ್ನು ಮಾತ್ರ ಬಳಸಿ"
-}
-PEST_SYNONYMS = {
-    "thrips": ["thrips", "kakki", "ಥ್ರಿಪ್ಸ್", "thrip"],
-    "aphid": ["aphid", "shikara", "aphids", "ಏಫಿಡ್"],
-    "powdery_mildew": ["powdery mildew", "powdery", "udupu haigalu", "powdery_mildew"],
-    "whitefly": ["whitefly", "white fly", "ಬೆಳ್ಳುಪೂಸು"],
-    "mite": ["mite", "mites", "ನೋಡುಮಟ್ಟಿ"],
-    "fruit_fly": ["fruit fly", "fruit_fly", "ಹಣ್ಣು ಕೀಟ"],
-    "mosaic_virus": ["mosaic", "virus", "ಮೋಸಾಯಿಕ್"],
-    # add more synonyms
-}
-# -----------------------------------------------------
-# ICAR / Govt Report Model
-# -----------------------------------------------------
-class PestReport(BaseModel):
-    reportId: str
-    district: str
-    crop: str
-    pest: Optional[str] = None
-    symptoms: Optional[str] = None
-    confidence: Optional[float] = 1.0
-    reportDate: Optional[str] = None
+pest_engine = PestEngine(
+    pest_db=PEST_DB,
+    pest_history=PEST_HISTORY
+)
 
-
-CROP_DB = {
-    # ---------------------------------------------
-    # 1. CHILLI
-    # ---------------------------------------------
-    "chilli": {
-        "thrips": {
-            "preventive": [
-                "Use blue sticky traps (40 per acre).",
-                "Avoid excess nitrogen application.",
-                "Maintain crop spacing for air circulation.",
-                "Remove nearby alternate host weeds."
-            ],
-            "corrective": [
-                "Spray neem oil 3%.",
-                "Use Beauveria bassiana bio-control.",
-                "If severe, use recommended insecticide as per local extension guidelines."
-            ]
-        },
-        "mosaic_virus": {
-            "preventive": [
-                "Use virus-free certified seeds.",
-                "Control aphid/thrips vectors.",
-                "Keep field weed-free.",
-                "Use reflective mulches to reduce vector landing."
-            ],
-            "corrective": [
-                "Remove infected plants immediately.",
-                "Spray neem oil to reduce vectors.",
-                "Avoid planting near older infected fields."
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 2. CUCUMBER
-    # ---------------------------------------------
-    "cucumber": {
-        "aphid": {
-            "preventive": [
-                "Use yellow sticky traps.",
-                "Encourage natural predators like ladybird beetles.",
-                "Avoid over-irrigation and excess nitrogen."
-            ],
-            "corrective": [
-                "Apply neem oil 5ml/litre.",
-                "Introduce Chrysoperla biological predators.",
-                "Use systemic insecticide only if infestation is very severe."
-            ]
-        },
-        "powdery_mildew": {
-            "preventive": [
-                "Use resistant varieties.",
-                "Ensure proper spacing and airflow.",
-                "Avoid overhead irrigation."
-            ],
-            "corrective": [
-                "Apply wettable sulfur.",
-                "Use Trichoderma-based bio fungicides.",
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 3. TOMATO
-    # ---------------------------------------------
-    "tomato": {
-        "fruit_borer": {
-            "preventive": [
-                "Install pheromone traps (Helilure).",
-                "Remove damaged fruits regularly.",
-                "Use bird perches to attract predators."
-            ],
-            "corrective": [
-                "Release Trichogramma chilonis egg parasitoids.",
-                "Spray neem seed kernel extract (NSKE).",
-                "Use selective insecticides only if severe."
-            ]
-        },
-        "early_blight": {
-            "preventive": [
-                "Use resistant varieties.",
-                "Maintain proper spacing.",
-                "Apply balanced fertilizers."
-            ],
-            "corrective": [
-                "Use copper-based fungicides.",
-                "Apply Trichoderma viride as soil treatment."
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 4. BRINJAL
-    # ---------------------------------------------
-    "brinjal": {
-        "shoot_and_fruit_borer": {
-            "preventive": [
-                "Use pheromone traps (20 per acre).",
-                "Remove damaged shoots & fruits regularly.",
-                "Grow resistant varieties."
-            ],
-            "corrective": [
-                "Release Trichogramma chilonis.",
-                "Apply NSKE 5%.",
-                "Use chemical insecticides responsibly only for heavy infestation."
-            ]
-        },
-        "whitefly": {
-            "preventive": [
-                "Use yellow sticky traps.",
-                "Maintain weed-free environment."
-            ],
-            "corrective": [
-                "Neem oil 3%.",
-                "Use recommended systemic insecticide if severe."
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 5. ONION
-    # ---------------------------------------------
-    "onion": {
-        "thrips": {
-            "preventive": [
-                "Maintain field hygiene.",
-                "Use reflective mulches.",
-            ],
-            "corrective": [
-                "Spray neem oil.",
-                "Use recommended insecticides responsibly."
-            ]
-        },
-        "purple_blotch": {
-            "preventive": [
-                "Ensure proper drainage.",
-                "Use resistant varieties."
-            ],
-            "corrective": [
-                "Apply mancozeb/copper fungicides per label.",
-                "Improve ventilation."
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 6. POTATO
-    # ---------------------------------------------
-    "potato": {
-        "late_blight": {
-            "preventive": [
-                "Use certified seeds.",
-                "Avoid overhead irrigation.",
-                "Plant in well-drained soils."
-            ],
-            "corrective": [
-                "Fungicide sprays recommended by extension.",
-                "Destroy infected plants."
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 7. GINGER
-    # ---------------------------------------------
-    "ginger": {
-        "rhizome_rot": {
-            "preventive": [
-                "Use disease-free planting material.",
-                "Ensure proper drainage.",
-                "Apply Trichoderma in pits."
-            ],
-            "corrective": [
-                "Remove affected plants.",
-                "Improving field drainage.",
-                "Apply bio-fungicides."
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 8. TURMERIC
-    # ---------------------------------------------
-    "turmeric": {
-        "leaf_blotch": {
-            "preventive": [
-                "Use healthy seed rhizomes.",
-                "Avoid water stagnation.",
-                "Maintain adequate spacing."
-            ],
-            "corrective": [
-                "Spray recommended fungicide.",
-                "Apply Trichoderma as soil drench."
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 9. ARECANUT
-    # ---------------------------------------------
-    "areca nut": {
-        "mite": {
-            "preventive": [
-                "Maintain irrigation.",
-                "Monitor regularly."
-            ],
-            "corrective": [
-                "Apply recommended miticide.",
-                "Remove infected tissue."
-            ]
-        },
-        "root_rot": {
-            "preventive": [
-                "Improve drainage.",
-                "Avoid waterlogging."
-            ],
-            "corrective": [
-                "Apply Bordeaux mixture.",
-                "Use Trichoderma around roots."
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 10. BANANA
-    # ---------------------------------------------
-    "banana": {
-        "sigatoka_leaf_spot": {
-            "preventive": [
-                "Use disease-free suckers.",
-                "Maintain field hygiene.",
-                "Ensure proper spacing."
-            ],
-            "corrective": [
-                "Apply copper fungicides.",
-                "Remove infected leaves."
-            ]
-        },
-        "rhizome_weevil": {
-            "preventive": [
-                "Use clean planting material.",
-                "Trap adult beetles."
-            ],
-            "corrective": [
-                "Use approved insecticide treatment.",
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 11. COCONUT
-    # ---------------------------------------------
-    "coconut": {
-        "eriophyid_mite": {
-            "preventive": [
-                "Maintain tree health.",
-                "Avoid nutrient deficiency."
-            ],
-            "corrective": [
-                "Apply neem oil emulsions.",
-                "Use recommended miticides."
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 12. COFFEE
-    # ---------------------------------------------
-    "coffee": {
-        "berry_borer": {
-            "preventive": [
-                "Shade regulation.",
-                "Sanitation harvest."
-            ],
-            "corrective": [
-                "Use recommended borer traps.",
-                "Destroy infested berries."
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 13. PEPPER
-    # ---------------------------------------------
-    "pepper": {
-        "wilt": {
-            "preventive": [
-                "Use disease-free vines.",
-                "Provide proper drainage."
-            ],
-            "corrective": [
-                "Apply Trichoderma.",
-                "Remove wilted vines."
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 14. CARDAMOM
-    # ---------------------------------------------
-    "cardamom": {
-        "thrips": {
-            "preventive": [
-                "Shade management.",
-                "Maintain humidity."
-            ],
-            "corrective": [
-                "Spray neem oil.",
-                "Use recommended insecticide selectively."
-            ]
-        }
-    },
-
-    # ---------------------------------------------
-    # 15. MANGO
-    # ---------------------------------------------
-    "mango": {
-        "hoppers": {
-            "preventive": ["Sanitation", "Prune for airflow"],
-            "corrective": ["Neem oil spray", "Use recommended insecticide"]
-        },
-        "powdery_mildew": {
-            "preventive": ["Maintain spacing", "Use resistant varieties"],
-            "corrective": ["Sulfur sprays", "Bio-fungicides"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 16. POMEGRANATE
-    # ---------------------------------------------
-    "pomegranate": {
-        "bacterial_blight": {
-            "preventive": ["Use disease-free seedlings", "Prune regularly"],
-            "corrective": ["Copper oxychloride spray", "Remove infected branches"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 17. GRAPES
-    # ---------------------------------------------
-    "grapes": {
-        "downy_mildew": {
-            "preventive": ["Avoid overhead irrigation", "Maintain airflow"],
-            "corrective": ["Apply metalaxyl-based fungicide", "Use Trichoderma"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 18. PADDY (RICE)
-    # ---------------------------------------------
-    "paddy": {
-        "blast": {
-            "preventive": ["Use resistant varieties", "Balanced fertilization"],
-            "corrective": ["Apply tricyclazole", "Improve drainage"]
-        },
-        "stem_borer": {
-            "preventive": ["Avoid staggered planting", "Use pheromone traps"],
-            "corrective": ["Release Trichogramma", "Selective insecticides"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 19. RAGI (FINGER MILLET)
-    # ---------------------------------------------
-    "ragi": {
-        "blast": {
-            "preventive": ["Use seed treatment", "Proper spacing"],
-            "corrective": ["Fungicide spray", "Rotate crops"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 20. MAIZE
-    # ---------------------------------------------
-    "maize": {
-        "fall_armyworm": {
-            "preventive": ["Early sowing", "Use pheromone traps"],
-            "corrective": ["Neem oil spray", "Use approved insecticides if severe"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 21. JOWAR (SORGHUM)
-    # ---------------------------------------------
-    "jowar": {
-        "shoot_fly": {
-            "preventive": ["Early sowing", "Seed treatment"],
-            "corrective": ["Use recommended insecticides if severe"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 22. SUGARCANE
-    # ---------------------------------------------
-    "sugarcane": {
-        "borer": {
-            "preventive": ["Destroy crop residues", "Use resistant varieties"],
-            "corrective": ["Release Trichogramma", "Use systemic insecticides"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 23. COTTON
-    # ---------------------------------------------
-    "cotton": {
-        "whitefly": {
-            "preventive": ["Remove alternate hosts", "Use reflective mulch"],
-            "corrective": ["Neem oil", "Use recommended insecticides if severe"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 24. GROUNDNUT
-    # ---------------------------------------------
-    "groundnut": {
-        "leaf_spot": {
-            "preventive": ["Crop rotation", "Use resistant varieties"],
-            "corrective": ["Fungicide spray", "Bio-control agents"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 25. SUNFLOWER
-    # ---------------------------------------------
-    "sunflower": {
-        "stem_borer": {
-            "preventive": ["Timely sowing", "Destroy stubbles"],
-            "corrective": ["Use light traps", "Recommended insecticide"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 26. SOYBEAN
-    # ---------------------------------------------
-    "soybean": {
-        "rust": {
-            "preventive": ["Early sowing", "Use resistant varieties"],
-            "corrective": ["Apply mancozeb", "Improve airflow"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 27. RED GRAM (TOOR)
-    # ---------------------------------------------
-    "red gram": {
-        "pod_borer": {
-            "preventive": ["Use pheromone traps", "Intercropping"],
-            "corrective": ["Use Helicoverpa NPV", "Selective insecticide"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 28. GREEN GRAM
-    # ---------------------------------------------
-    "green gram": {
-        "whitefly": {
-            "preventive": ["Remove weeds", "Use yellow traps"],
-            "corrective": ["Neem oil", "Recommended insecticides"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 29. BLACK GRAM
-    # ---------------------------------------------
-    "black gram": {
-        "leaf_crinkle": {
-            "preventive": ["Vector control", "Use certified seeds"],
-            "corrective": ["Remove infected plants"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 30. HORSE GRAM
-    # ---------------------------------------------
-    "horse gram": {
-        "leaf_spot": {
-            "preventive": ["Proper spacing", "Avoid monocropping"],
-            "corrective": ["Fungicide spray"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 31. SESAME
-    # ---------------------------------------------
-    "sesame": {
-        "powdery_mildew": {
-            "preventive": ["Use resistant variety", "Avoid high humidity"],
-            "corrective": ["Sulfur spray"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 32. CASTOR
-    # ---------------------------------------------
-    "castor": {
-        "semilooper": {
-            "preventive": ["Hand-picking larvae", "Light traps"],
-            "corrective": ["Neem oil", "Biocontrol agents"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 33. WATERMELON
-    # ---------------------------------------------
-    "watermelon": {
-        "fruit_fly": {
-            "preventive": ["Use pheromone traps", "Clean cultivation"],
-            "corrective": ["Bait traps", "Recommended insecticide"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 34. PUMPKIN
-    # ---------------------------------------------
-    "pumpkin": {
-        "red_pumpkin_beetle": {
-            "preventive": ["Early sowing", "Clean cultivation"],
-            "corrective": ["Neem spray", "Recommended insecticide"]
-        }
-    },
-
-    # ---------------------------------------------
-    # 35. BEANS
-    # ---------------------------------------------
-    "beans": {
-        "bean_mosaic_virus": {
-            "preventive": ["Use virus-free seeds", "Control aphids"],
-            "corrective": ["Remove infected plants"]
-        }
-    }
-}
-
-DEFAULT_PREVENTIVE = ["Scout fields daily", "Maintain hygiene", "Use IPM"]
-DEFAULT_CORRECTIVE = ["Consult extension officer", "Use approved inputs only"]
-
-# -------------------------
-# Models / ML loader (optional)
-# -------------------------
-ML_MODEL = None
-if ML_MODEL_PATH and joblib:
-    try:
-        ML_MODEL = joblib.load(ML_MODEL_PATH)
-        print("Loaded ML model from", ML_MODEL_PATH)
-    except Exception as e:
-        print("Could not load model:", e)
-        ML_MODEL = None
-
-# -------------------------
-# Pydantic models
-# -------------------------
-class PestReport(BaseModel):
-    reportId: str
-    district: str
-    crop: str
-    pest: Optional[str] = None
-    symptoms: Optional[str] = None
-    confidence: Optional[float] = 1.0
-    reportDate: Optional[str] = None
-# -------------------------
-# Utility helpers
-# -------------------------
-def now_ts_ms() -> int:
+def now_ts_ms():
     return int(time.time() * 1000)
 
 
-def parse_iso_date(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(s, fmt)
-        except Exception:
-            continue
-    try:
-        return datetime.fromtimestamp(int(s))
-    except Exception:
-        return None
-    
-def translate_to_kannada(key: str) -> str:
-    return KANANDA_TRANSLATIONS.get(key, key)
-
-
-def normalize_text(s: Optional[str]) -> str:
-    return (s or "").strip().lower()
-
-def match_synonym(pest_text: str) -> Optional[str]:
-    """
-    Try to match a reported pest string to canonical pest keys using synonyms.
-    Returns canonical pest key (like 'thrips') or None.
-    """
-    if not pest_text:
-        return None
-    p = normalize_text(pest_text)
-    for canon, syns in PEST_SYNONYMS.items():
-        for token in syns:
-            if token.lower() in p:
-                return canon
-    # direct equality fallback
-    if p in PEST_SYNONYMS:
-        return p
-    return None
-
-# -------------------------
-# Weather integration
-# -------------------------
-def fetch_weather_for_district(district: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetch recent / current weather for district using WEATHER_API_URL.
-    The expected provider should accept lat & lon query params; this function is written
-    generically for Open-Meteo-like APIs. If your provider differs, adapt accordingly.
-    """
-    coords = DISTRICT_COORDS.get(district.lower())
-    if not coords or not WEATHER_API_URL:
-        return None
-
-    params = {
-        "latitude": coords["lat"],
-        "longitude": coords["lon"],
-        "current_weather": True,
-        # optionally daily rainfall/humidity forecasts if provider supports
-        # (For Open-Meteo you'd request hourly variables)
-    }
-    if WEATHER_API_KEY:
-        # if provider expects key as 'apikey' or 'key', you may need to change param name
-        params["apikey"] = WEATHER_API_KEY
-
-    try:
-        resp = requests.get(WEATHER_API_URL, params=params, timeout=10)
-        if resp.status_code != 200:
-            return None
-        return resp.json()
-    except Exception:
-        return None
-    
-def assess_weather_risk(weather_json: Dict[str, Any]) -> Dict[str, float]:
-    """
-    Return adjustments to risk score based on weather.
-    Simple heuristic:
-      - high humidity or recent heavy rainfall increases fungal disease risk -> +0.15
-      - high temperature + dryness increases thrips/aphid risk -> +0.10
-    The structure of weather_json depends on provider; this checks common keys.
-    """
-    add_score = 0.0
-    reasons = []
-
-    # Try common patterns
-    cw = weather_json.get("current_weather") or weather_json.get("current") or {}
-    # many APIs use 'temperature' or 'temp', humidity may be absent
-    temp = cw.get("temperature") or cw.get("temp") or None
-    humidity = None
-    # Some APIs return hourly/daily arrays — we try to read 'relativehumidity_2m' if present
-    if "hourly" in weather_json and "relativehumidity_2m" in weather_json["hourly"]:
-        # pick latest
-        try:
-            humidity = weather_json["hourly"]["relativehumidity_2m"][-1]
-        except Exception:
-            humidity = None
-    else:
-        humidity = cw.get("relativehumidity") or cw.get("humidity")
-
-    # Rainfall: try daily precipitation sum
-    rain = None
-    if "daily" in weather_json and "rain_sum" in weather_json["daily"]:
-        try:
-            rain = weather_json["daily"]["rain_sum"][-1]
-        except Exception:
-            rain = None
-    else:
-        # provider-specific
-        rain = cw.get("precipitation") or cw.get("rain")
-
-    # Heuristics
-    if humidity and float(humidity) >= 80:
-        add_score += 0.15
-        reasons.append(f"High humidity ({humidity}%) increases fungal risk")
-    if rain and float(rain) >= 15:
-        add_score += 0.10
-        reasons.append(f"Recent heavy rain ({rain} mm) favors disease spread")
-    if temp and float(temp) >= 33 and (not humidity or float(humidity) < 50):
-        add_score += 0.08
-        reasons.append(f"High temperature ({temp}°C) with low humidity favors some pests")
-
-    return {"delta": add_score, "reasons": reasons}
-
-# -------------------------
-# Firebase helpers
-# -------------------------
-def read_user(uid: str):
-    return db.reference(f"Users/{uid}").get()
-
-def get_user_crops(user: dict) -> List[str]:
-    crops = []
-
-    crop_data = user.get("crops", {})
-
-    primary = crop_data.get("primary")
-    if isinstance(primary, dict) and primary.get("cropName"):
-        crops.append(primary["cropName"])
-
-    secondary = crop_data.get("secondary")
-    if isinstance(secondary, dict) and secondary.get("cropName"):
-        crops.append(secondary["cropName"])
-
-    return list(set(crops))  # remove duplicates safely
+def read_user(uid: str) -> Optional[Dict[str, Any]]:
+    return db.reference("Users").child(uid).get()
 
 
 def store_alert(uid: str, alert: Dict[str, Any]) -> str:
@@ -820,475 +48,114 @@ def store_alert(uid: str, alert: Dict[str, Any]) -> str:
     return aid
 
 
-def send_fcm(fcm_token: str, title: str, body: str):
-    if not fcm_token:
-        return
-    try:
-        msg = messaging.Message(notification=messaging.Notification(title=title, body=body), token=fcm_token)
-        messaging.send(msg)
-    except Exception as e:
-        # don't fail whole operation on push error; log it
-        print("FCM send error:", e)
+def get_user_crops(user: dict) -> List[str]:
+    crops = []
+    farm = user.get("farmDetails", {})
 
-def get_district_breakdown(district: str, crop_name: str) -> List[Dict[str, Any]]:
-    """
-    Returns disease breakdown for a crop in a district based on historical data
-    """
-    month = month_name[datetime.utcnow().month].lower()
-    district = normalize_text(district)
-    crop = normalize_text(crop_name)
+    if farm.get("primaryCrop"):
+        crops.append(farm["primaryCrop"])
 
-    breakdown = []
+    crops.extend(farm.get("secondaryCrops", []))
 
-    district_data = PEST_HISTORY.get(district, {})
-    crop_data = district_data.get(crop, {})
+    return list(set(crops))
 
-    for pest, months in crop_data.items():
-        if month in months:
-            pest_info = PEST_DB.get(pest, {})
-
-            breakdown.append({
-                "pest": pest,
-                "severity": pest_info.get("severity", "moderate"),
-                "activeMonth": month,
-                "symptoms": pest_info.get("symptoms", []),
-                "preventive": pest_info.get("preventive", DEFAULT_PREVENTIVE)
-            })
-
-    return breakdown
-
-# -------------------------
-# OUTBREAK ALERT (NEW)
-# -------------------------
-def generate_district_outbreak_alert(
-        uid: str,
-        crop_name: str,
-        district_reports: List[Dict[str, Any]]
-):
-    """
-    Creates preventive alert if crop is already affected in district
-    """
-    crop_low = normalize_text(crop_name)
-
-    for r in district_reports:
-        if normalize_text(r.get("crop")) == crop_low:
-            pest = match_synonym(r.get("pest"))
-            preventive = DEFAULT_PREVENTIVE
-
-            if pest and crop_low in CROP_DB and pest in CROP_DB[crop_low]:
-                preventive = CROP_DB[crop_low][pest].get("preventive", preventive)
-
-            return {
-                "uid": uid,
-                "cropName": crop_name,
-                "timestamp": now_ts_ms(),
-                "riskScore": 0.35,
-                "severity": "moderate",
-                "complexityLevel": "simple",
-                "triggerPest": pest or "unknown",
-                "reasons": [
-                    f"{pest} outbreak already reported in your district"
-                ],
-                "preventiveMeasures": preventive,
-                "correctiveMeasures": [],
-                "alertType": "district_outbreak"
-            }
-    return None
-
-def current_month():
-    return month_name[datetime.utcnow().month]
-
-
-def generate_district_disease_alerts(
-    uid: str,
-    district: str,
-    crop_name: str
-) -> List[Dict[str, Any]]:
-    """
-    Generate district-wise disease breakdown alerts using static pest history
-    """
-    district = normalize_text(district)
-    crop = normalize_text(crop_name)
-    month = current_month()
-
-    alerts = []
-
-    if district not in PEST_HISTORY:
-        return alerts
-
-    if crop not in PEST_HISTORY[district]:
-        return alerts
-
-    for disease, meta in PEST_HISTORY[district][crop].items():
-
-        # Check seasonality
-        if month not in meta.get("season", []):
-            continue
-
-        disease_info = PEST_DB.get(crop, {}).get(disease, {})
-
-        risk_level = meta.get("risk_level", "MEDIUM")
-
-        risk_score = (
-            0.3 if risk_level == "LOW"
-            else 0.5 if risk_level == "MEDIUM"
-            else 0.7
-        )
-
-        alerts.append({
-            "uid": uid,
-            "cropName": crop_name,
-            "timestamp": now_ts_ms(),
-            "alertType": "district_disease_breakdown",
-            "triggerPest": disease,
-            "severity": risk_level.lower(),
-            "complexityLevel": "simple",
-            "riskScore": risk_score,
-            "reasons": [
-                f"{disease.replace('_',' ').title()} reported in {district.title()} during {month}",
-                f"District risk level: {risk_level}"
-            ],
-            "symptoms": disease_info.get("symptoms", []),
-            "preventiveMeasures": disease_info.get("preventive", []),
-            "correctiveMeasures": disease_info.get("corrective", [])
-        })
-
-    return alerts
-
-
-# -------------------------
-# Risk computation (rule + ML + synonyms + weather)
-# -------------------------
-def compute_rule_score(crop_name: str, logs: Dict[str, Any], district_reports: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Rule-based scoring:
-      - farmer symptoms: +0.25 each unique symptom (capped)
-      - matching official report for same crop: +0.45 per report (cap)
-      - no recent irrigation >10 days: +0.05
-      - soil imbalance small +0.05
-    Returns dict with score (0..1), triggered pests list, reasons
-    """
-    score = 0.0
-    reasons = []
-    triggered = []
-
-    crop_low = normalize_text(crop_name)
-
-    # farmer symptoms
-    symptom_count = 0
-    for lid, entry in (logs.items() if isinstance(logs, dict) else []):
-        if isinstance(entry, dict):
-            sym = entry.get("symptoms")
-            if sym and normalize_text(sym) not in ("na", "no", "none", ""):
-                symptom_count += 1
-                score += 0.25
-                reasons.append(f"Farmer-reported symptom: {sym}")
-    # official reports matching crop or synonyms
-    for rep in district_reports:
-        rep_crop = normalize_text(rep.get("crop", ""))
-        rep_pest_text = rep.get("pest") or ""
-        rep_pest = match_synonym(rep_pest_text) or normalize_text(rep_pest_text)
-        # match crop name exactly or loosely
-        if rep_crop == crop_low or rep_pest in (CROP_DB.get(crop_low, {}) or {}):
-            score += 0.45 * float(rep.get("confidence", 1.0))
-            reasons.append(f"Official report: {rep.get('pest')} on {rep.get('crop')}")
-            triggered.append(rep_pest)
-
-    # irrigation gap heuristic
-    # look for lastIrrigationDate in logs
-    last_ir = None
-    for lid, entry in (logs.items() if isinstance(logs, dict) else []):
-        if isinstance(entry, dict) and entry.get("lastIrrigationDate"):
-            last_ir = parse_iso_date(entry.get("lastIrrigationDate"))
-    if last_ir:
-        days = (datetime.utcnow() - last_ir).days
-        if days > 10:
-            score += 0.05
-            reasons.append(f"Last irrigation {days} days ago")
-
-    # soil test heuristic
-    for lid, entry in (logs.items() if isinstance(logs, dict) else []):
-        if isinstance(entry, dict) and entry.get("soilTest"):
-            soil = entry.get("soilTest") or {}
-            if soil.get("N", 999) < 10 or soil.get("K", 999) < 5:
-                score += 0.05
-                reasons.append("Soil test shows low nutrients")
-
-    # cap
-    score = min(score, 1.0)
-    return {"score": round(score, 3), "reasons": reasons, "triggered": triggered, "symptom_count": symptom_count}
-def compute_ml_score(features: Dict[str, float]) -> Optional[float]:
-    """
-    If ML_MODEL loaded, predict probability. Expects feature dict with known keys by model.
-    If no model, returns None.
-    """
-    if not ML_MODEL:
-        return None
-    try:
-        # This assumes model expects a consistent feature order; define it here
-        feat_order = ["nearby_reports", "symptom_count", "days_since_irrigation", "soil_stress", "weather_fungal_delta"]
-        x = [features.get(k, 0.0) for k in feat_order]
-        prob = float(ML_MODEL.predict_proba([x])[0][1])
-        return prob
-    except Exception as e:
-        print("ML predict error:", e)
-        return None
-    
-def fuse_scores(rule_score: float, ml_score: Optional[float]) -> float:
-    """
-    Fuse ML and rule scores. If ML exists, weight both:
-     - final = 0.6*rule + 0.4*ml (adjustable). If ml missing, return rule.
-    """
-    if ml_score is None:
-        return rule_score
-    return round(min(1.0, 0.6 * rule_score + 0.4 * ml_score), 3)
-
-
-def classify_severity(score: float) -> str:
-    if score >= 0.7:
-        return "high"
-    if score >= 0.35:
-        return "moderate"
-    return "low"
-
-def classify_complexity(score: float, symptom_count: int, official_reports: int) -> str:
-    # simple rules as requested
-    if score < 0.3 and symptom_count <= 1 and official_reports == 0:
-        return "simple"
-    if 0.3 <= score < 0.6 and (symptom_count > 1 or official_reports > 0):
-        return "moderate"
-    if 0.6 <= score < 0.8 and official_reports > 0 and symptom_count > 1:
-        return "complex"
-    if score >= 0.8 and official_reports > 0 and symptom_count > 1:
-        return "critical"
-    return "moderate"
-
-# -------------------------
-# Endpoints
-# -------------------------
-@app.post("/ingest/report")
-def ingest_report(report: PestReport):
-    pr_ref = db.reference("pest_reports")
-    payload = {
-        "district": report.district,
-        "crop": report.crop,
-        "pest": report.pest,
-        "symptoms": report.symptoms,
-        "reportDate": report.reportDate or datetime.utcnow().strftime("%Y-%m-%d"),
-        "confidence": report.confidence,
-        "timestamp": now_ts_ms()
+def fetch_weather_for_district(district: str) -> Dict[str, float]:
+    # You can replace this with real API later
+    return {
+        "temp": 32.0,
+        "humidity": 75.0,
+        "rainfall": 12.0
     }
-    pr_ref.child(report.reportId).set(payload)
-    return {"status": "ok", "reportId": report.reportId}
-
-def deduplicate_by_crop(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Keep only one alert per crop.
-    Priority:
-      1. Higher severity
-      2. Higher riskScore
-      3. Latest timestamp
-    """
-    priority = {"high": 3, "moderate": 2, "low": 1}
-    result = {}
-
-    for alert in alerts:
-        crop = alert.get("cropName")
-        if not crop:
-            continue
-
-        if crop not in result:
-            result[crop] = alert
-        else:
-            old = result[crop]
-
-            if priority.get(alert["severity"], 0) > priority.get(old["severity"], 0):
-                result[crop] = alert
-            elif alert.get("riskScore", 0) > old.get("riskScore", 0):
-                result[crop] = alert
-            elif alert.get("timestamp", 0) > old.get("timestamp", 0):
-                result[crop] = alert
-
-    return list(result.values())
 
 @app.post("/scan/farmer/{uid}")
-def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
+def scan_farmer(uid: str):
 
-    # ----------------------------
-    # 1. READ USER
-    # ----------------------------
+    # -------------------------------
+    # 1. LOAD USER
+    # -------------------------------
     user = read_user(uid)
     if not user:
-        raise HTTPException(status_code=404, detail="Farmer not found")
+        raise HTTPException(404, "Farmer not found")
 
-    district = (user.get("farmDetails") or {}).get("district")
+    farm = user.get("farmDetails", {})
+    district = farm.get("district")
+    taluk = farm.get("taluk")
+    soil_type = farm.get("soilType")
+    stage = farm.get("cropStage")
+
     if not district:
-        raise HTTPException(status_code=400, detail="Farmer district missing")
+        raise HTTPException(400, "District missing")
 
-    # ----------------------------
-    # 2. GET PRIMARY + SECONDARY CROPS
-    # ----------------------------
-    crop_list = get_user_crops(user)
-    if not crop_list:
-        raise HTTPException(status_code=400, detail="No crops found for farmer")
+    # -------------------------------
+    # 2. GET ALL CROPS
+    # -------------------------------
+    crops = get_user_crops(user)
+    if not crops:
+        raise HTTPException(400, "No crops found")
 
-    farm_logs = user.get("farmActivityLogs", {}) or {}
+    # -------------------------------
+    # 3. WEATHER INPUT
+    # -------------------------------
+    weather = fetch_weather_for_district(district)
 
-    # ----------------------------
-    # 3. LOAD DISTRICT REPORTS
-    # ----------------------------
-    district_reports = []
-    pr_ref = db.reference("pest_reports")
-    all_reports = pr_ref.get() or {}
-
-    cutoff = datetime.utcnow() - timedelta(days=LOOKBACK_DAYS)
-
-    for r in all_reports.values():
-        rdate = parse_iso_date(r.get("reportDate"))
-        if (
-            rdate
-            and rdate >= cutoff
-            and normalize_text(r.get("district")) == normalize_text(district)
-        ):
-            district_reports.append(r)
-
-    # ----------------------------
-    # 4. WEATHER ASSESSMENT
-    # ----------------------------
-    weather_json = fetch_weather_for_district(district)
-    weather_assessment = (
-        assess_weather_risk(weather_json)
-        if weather_json
-        else {"delta": 0.0, "reasons": []}
-    )
-
-    alerts_created = []
-
-    # =====================================================
-    # 5. 🔥 LOOP **PER CROP**, NOT PER LOG
-    # =====================================================
-    for crop_name in crop_list:
-
-        # collect logs only for this crop
-        crop_logs = {
-            k: v
-            for k, v in farm_logs.items()
-            if isinstance(v, dict) and v.get("cropName") == crop_name
-        }
-
-        # ----------------------------
-        # RULE ENGINE
-        # ----------------------------
-        rule_res = compute_rule_score(crop_name, crop_logs, district_reports)
-        rule_score = min(1.0, rule_res["score"] + weather_assessment["delta"])
-
-        severity = classify_severity(rule_score)
-        complexity = classify_complexity(
-            rule_score,
-            rule_res.get("symptom_count", 0),
-            len(district_reports),
-        )
-
-        trigger_pest = (
-            rule_res["triggered"][0]
-            if rule_res.get("triggered")
-            else "unknown"
-        )
-
-        # ----------------------------
-        # MEASURES
-        # ----------------------------
-        preventive = DEFAULT_PREVENTIVE
-        corrective = DEFAULT_CORRECTIVE
-
-        crop_db = CROP_DB.get(crop_name.lower(), {})
-        if trigger_pest in crop_db:
-            preventive = crop_db[trigger_pest].get("preventive", preventive)
-            corrective = crop_db[trigger_pest].get("corrective", corrective)
-
-        # ----------------------------
-        # 🆕 DISTRICT DISEASE BREAKDOWN
-        # ----------------------------
-        district_breakdown = get_district_breakdown(district, crop_name)
-
-        # ----------------------------
-        # ALERT OBJECT (ONE PER CROP)
-        # ----------------------------
-        alert = {
-            "uid": uid,
-            "cropName": crop_name,
-            "timestamp": now_ts_ms(),
-            "alertType": "scan_result",
-            "riskScore": round(rule_score, 3),
-            "severity": severity,
-            "complexityLevel": complexity,
-            "triggerPest": trigger_pest,
-            "reasons": rule_res["reasons"] + weather_assessment["reasons"],
-            "preventiveMeasures": preventive,
-            "correctiveMeasures": corrective,
-            "districtBreakdown": district_breakdown,
-        }
-
-        alerts_created.append(alert)
-
-    # =====================================================
-    # 6. CLEAR OLD ALERTS + STORE NEW ONES
-    # =====================================================
+    # -------------------------------
+    # 4. CLEAR OLD ALERTS
+    # -------------------------------
     db.reference(f"alerts/{uid}").delete()
 
-    stored = []
-    for alert in alerts_created:
-        aid = store_alert(uid, alert)
-        stored.append({**alert, "alertId": aid})
+    stored_alerts = []
+
+    # ==================================================
+    # 5. RUN PEST ENGINE FOR EACH CROP
+    # ==================================================
+    for crop in crops:
+
+        pest_results = pest_engine.predict(
+            cropName=crop,
+            district=district,
+            taluk=taluk,
+            soilType=soil_type,
+            stage=stage,
+            temp=weather["temp"],
+            humidity=weather["humidity"],
+            rainfall=weather["rainfall"],
+            month_int=datetime.utcnow().month,
+            lang=farm.get("language", "en")
+        )
+
+        for p in pest_results:
+            alert = {
+                "uid": uid,
+                "cropName": crop,
+                "timestamp": now_ts_ms(),
+                "alertType": "pest_detection",
+                "pestName": p["pestName"],
+                "riskLevel": p["riskLevel"],
+                "riskScore": p["score"],
+                "reasons": p["reasons"],
+                "symptoms": p["symptoms"],
+                "preventiveMeasures": p["preventive"],
+                "correctiveMeasures": p["corrective"]
+            }
+
+            aid = store_alert(uid, alert)
+            stored_alerts.append({**alert, "alertId": aid})
 
     return {
         "status": "ok",
-        "totalCrops": len(stored),
-        "alerts": stored,
+        "totalCrops": len(crops),
+        "totalAlerts": len(stored_alerts),
+        "alerts": stored_alerts
     }
 
 @app.get("/alerts/{uid}")
-def get_alerts(uid: str, lang: str = "en"):
-    alerts = db.reference(f"alerts/{uid}").get() or {}
-
-    # Only translate VALUES, never KEYS
-    if lang.lower().startswith("kn"):
-        for aid, alert in alerts.items():
-
-            # Translate severity
-            if "severity" in alert:
-                alert["severityLabel"] = translate_to_kannada(alert["severity"])
-
-            # Translate complexity
-            if "complexityLevel" in alert:
-                alert["complexityLabel"] = translate_to_kannada(alert["complexityLevel"])
-
-            # Translate reasons
-            if "reasons" in alert and isinstance(alert["reasons"], list):
-                alert["reasonsLabel"] = [
-                    translate_to_kannada(r) for r in alert["reasons"]
-                ]
-
-            # Translate preventive measures
-            if "preventiveMeasures" in alert:
-                alert["preventiveMeasuresLabel"] = [
-                    translate_to_kannada(m) for m in alert["preventiveMeasures"]
-                ]
-
-            # Translate corrective measures
-            if "correctiveMeasures" in alert:
-                alert["correctiveMeasuresLabel"] = [
-                    translate_to_kannada(m) for m in alert["correctiveMeasures"]
-                ]
-
-    return alerts
+def get_alerts(uid: str):
+    return db.reference(f"alerts/{uid}").get() or {}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
-
-
-
-
-
+    return {
+        "status": "ok",
+        "time": datetime.utcnow().isoformat()
+    }
