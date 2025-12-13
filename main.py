@@ -1244,7 +1244,7 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
             "preventiveMeasures": preventive,
             "correctiveMeasures": corrective,
             "mlProbability": ml_prob,
-            "weatherDelta": weather_assessment.get("delta", 0.0)
+            "weatherDelta": weather_assessment.get("delta", 0.0),
             "districtBreakdown": district_breakdown
         }
 
@@ -1309,4 +1309,5 @@ def get_alerts(uid: str, lang: str = "en"):
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
 
