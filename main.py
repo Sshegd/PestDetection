@@ -653,7 +653,17 @@ if ML_MODEL_PATH and joblib:
         print("Could not load model:", e)
         ML_MODEL = None
 
-
+# -------------------------
+# Pydantic models
+# -------------------------
+class PestReport(BaseModel):
+    reportId: str
+    district: str
+    crop: str
+    pest: Optional[str] = None
+    symptoms: Optional[str] = None
+    confidence: Optional[float] = 1.0
+    reportDate: Optional[str] = None
 # -------------------------
 # Utility helpers
 # -------------------------
@@ -784,16 +794,11 @@ def assess_weather_risk(weather_json: Dict[str, Any]) -> Dict[str, float]:
 # Firebase helpers
 # -------------------------
 def read_user(uid: str) -> Optional[Dict[str, Any]]:
-    """
-    Read user data from Firebase under Users/<uid>
-    """
-    try:
-        ref = db.reference(f"Users/{uid}")
-        return ref.get()
-    except Exception as e:
-        print("Firebase read error:", e)
+    root = db.reference("/")
+    data = root.get()
+    if not data:
         return None
-
+    return data.get(uid)
 
 
 def store_alert(uid: str, alert: Dict[str, Any]) -> str:
@@ -801,7 +806,6 @@ def store_alert(uid: str, alert: Dict[str, Any]) -> str:
     aid = f"alert_{now_ts_ms()}"
     ref.child(aid).set(alert)
     return aid
-
 
 
 def send_fcm(fcm_token: str, title: str, body: str):
@@ -813,6 +817,47 @@ def send_fcm(fcm_token: str, title: str, body: str):
     except Exception as e:
         # don't fail whole operation on push error; log it
         print("FCM send error:", e)
+
+
+# -------------------------
+# OUTBREAK ALERT (NEW)
+# -------------------------
+def generate_district_outbreak_alert(
+        uid: str,
+        crop_name: str,
+        district_reports: List[Dict[str, Any]]
+):
+    """
+    Creates preventive alert if crop is already affected in district
+    """
+    crop_low = normalize_text(crop_name)
+
+    for r in district_reports:
+        if normalize_text(r.get("crop")) == crop_low:
+            pest = match_synonym(r.get("pest"))
+            preventive = DEFAULT_PREVENTIVE
+
+            if pest and crop_low in CROP_DB and pest in CROP_DB[crop_low]:
+                preventive = CROP_DB[crop_low][pest].get("preventive", preventive)
+
+            return {
+                "uid": uid,
+                "cropName": crop_name,
+                "timestamp": now_ts_ms(),
+                "riskScore": 0.35,
+                "severity": "moderate",
+                "complexityLevel": "simple",
+                "triggerPest": pest or "unknown",
+                "reasons": [
+                    f"{pest} outbreak already reported in your district"
+                ],
+                "preventiveMeasures": preventive,
+                "correctiveMeasures": [],
+                "alertType": "district_outbreak"
+            }
+    return None
+
+
 # -------------------------
 # Risk computation (rule + ML + synonyms + weather)
 # -------------------------
@@ -1088,6 +1133,22 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
         aid = store_alert(uid, alert)
         alerts_created.append({**alert, "alertId": aid})
 
+        # ===============================
+        # 🆕 DISTRICT OUTBREAK CHECK
+        # ===============================
+        if severity == "low":
+            outbreak_alert = generate_district_outbreak_alert(
+                uid=uid,
+                crop_name=crop_name,
+                district_reports=district_reports
+            )
+
+        if outbreak_alert:
+            outbreak_id = store_alert(uid, outbreak_alert)
+            alerts_created.append({
+                **outbreak_alert,
+                "alertId": outbreak_id
+            })
         # push notification
         if send_push and fcm_token:
             title = f"Pest Alert: {crop_name} ({severity})"
@@ -1101,28 +1162,41 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
 
 @app.get("/alerts/{uid}")
 def get_alerts(uid: str, lang: str = "en"):
-    raw = db.reference(f"alerts/{uid}").get() or {}
-    if lang and lang.lower().startswith("kn"):
-        # translate top-level fields where mapping exists
-        translated = {}
-        for aid, a in raw.items():
-            t = {}
-            for k, v in a.items():
-                key_trans = translate_to_kannada(k) if isinstance(k, str) else k
-                # for enumerations like severity/complexity translate values too
-                if k in ("severity", "complexityLevel"):
-                    if isinstance(v, str):
-                        val_trans = translate_to_kannada(v)
-                        t[key_trans] = val_trans
-                    else:
-                        t[key_trans] = v
-                else:
-                    t[key_trans] = v
-            translated[aid] = t
-        return translated
-    return raw
+    alerts = db.reference(f"alerts/{uid}").get() or {}
+
+    # Only translate VALUES, never KEYS
+    if lang.lower().startswith("kn"):
+        for aid, alert in alerts.items():
+
+            # Translate severity
+            if "severity" in alert:
+                alert["severityLabel"] = translate_to_kannada(alert["severity"])
+
+            # Translate complexity
+            if "complexityLevel" in alert:
+                alert["complexityLabel"] = translate_to_kannada(alert["complexityLevel"])
+
+            # Translate reasons
+            if "reasons" in alert and isinstance(alert["reasons"], list):
+                alert["reasonsLabel"] = [
+                    translate_to_kannada(r) for r in alert["reasons"]
+                ]
+
+            # Translate preventive measures
+            if "preventiveMeasures" in alert:
+                alert["preventiveMeasuresLabel"] = [
+                    translate_to_kannada(m) for m in alert["preventiveMeasures"]
+                ]
+
+            # Translate corrective measures
+            if "correctiveMeasures" in alert:
+                alert["correctiveMeasuresLabel"] = [
+                    translate_to_kannada(m) for m in alert["correctiveMeasures"]
+                ]
+
+    return alerts
+
 
 @app.get("/health")
 def health():
-
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
