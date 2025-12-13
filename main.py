@@ -1102,15 +1102,7 @@ def deduplicate_by_crop(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 @app.post("/scan/farmer/{uid}")
 def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
-    """
-    Run full scan for a farmer:
-      - reads farmActivityLogs (primary + secondary)
-      - fetches official reports for district
-      - fetches weather and adjusts risk
-      - optionally uses ML model if provided
-      - stores alerts under /alerts/<uid>/<alertId>
-      - optionally sends FCM push (if fcmToken stored)
-    """
+
     user = read_user(uid)
     if not user:
         raise HTTPException(status_code=404, detail="Farmer not found")
@@ -1120,145 +1112,83 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
         raise HTTPException(status_code=400, detail="Farmer district missing")
 
     farm_logs = user.get("farmActivityLogs", {}) or {}
-    fcm_token = user.get("fcmToken")
     district_reports = []
-    try:
-        # read official reports from firebase
-        pr_ref = db.reference("pest_reports")
-        all_reports = pr_ref.get() or {}
-        cutoff = datetime.utcnow() - timedelta(days=LOOKBACK_DAYS)
-        for rid, r in all_reports.items():
-            rdate = parse_iso_date(r.get("reportDate"))
-            if rdate and rdate >= cutoff and normalize_text(r.get("district", "")) == normalize_text(district):
-                district_reports.append(r)
-    except Exception as e:
-        print("Error loading pest_reports:", e)
-        district_reports = []
 
-    # Weather fetch + assessment
+    # Load official reports
+    pr_ref = db.reference("pest_reports")
+    all_reports = pr_ref.get() or {}
+    cutoff = datetime.utcnow() - timedelta(days=LOOKBACK_DAYS)
+
+    for r in all_reports.values():
+        rdate = parse_iso_date(r.get("reportDate"))
+        if rdate and rdate >= cutoff and normalize_text(r.get("district")) == normalize_text(district):
+            district_reports.append(r)
+
     weather_json = fetch_weather_for_district(district)
-    weather_assessment = {"delta": 0.0, "reasons": []}
-    if weather_json:
-        try:
-            weather_assessment = assess_weather_risk(weather_json)
-        except Exception:
-            weather_assessment = {"delta": 0.0, "reasons": []}
+    weather_assessment = assess_weather_risk(weather_json) if weather_json else {"delta": 0.0, "reasons": []}
 
     alerts_created = []
 
     for crop_key, logs in farm_logs.items():
-        # determine cropName
+
         crop_name = None
         if isinstance(logs, dict):
-            # logs normally has nested entries; try to find cropName
-            for _, v in logs.items():
+            for v in logs.values():
                 if isinstance(v, dict) and v.get("cropName"):
                     crop_name = v.get("cropName")
                     break
-            # if top-level mapping had cropName (rare), use it
-            if not crop_name and logs.get("cropName"):
+            if not crop_name:
                 crop_name = logs.get("cropName")
+
         if not crop_name:
             continue
 
-        # RULE SCORE
         rule_res = compute_rule_score(crop_name, logs, district_reports)
-        rule_score = rule_res["score"]
+        rule_score = min(1.0, rule_res["score"] + weather_assessment["delta"])
 
-        # weather adjustment
-        rule_score = min(1.0, round(rule_score + weather_assessment.get("delta", 0.0), 3))
-
-        # ML features extraction
-        days_since_irrig = 0
-        last_ir = None
-        for lid, entry in (logs.items() if isinstance(logs, dict) else []):
-            if isinstance(entry, dict) and entry.get("lastIrrigationDate"):
-                last_ir = parse_iso_date(entry.get("lastIrrigationDate"))
-        if last_ir:
-            days_since_irrig = (datetime.utcnow() - last_ir).days
-
-        soil_stress = 0.0
-        for lid, entry in (logs.items() if isinstance(logs, dict) else []):
-            if isinstance(entry, dict) and entry.get("soilTest"):
-                soil = entry.get("soilTest")
-                if soil:
-                    if soil.get("N", 999) < 10 or soil.get("K", 999) < 5:
-                        soil_stress = 1.0
-
-        features = {
-            "nearby_reports": float(len(district_reports)),
-            "symptom_count": float(rule_res.get("symptom_count", 0)),
-            "days_since_irrigation": float(days_since_irrig),
-            "soil_stress": float(soil_stress),
-            "weather_fungal_delta": float(weather_assessment.get("delta", 0.0))
-        }
-
-        ml_prob = compute_ml_score(features)
-
-        final_score = fuse_scores(rule_score, ml_prob)
+        final_score = rule_score
         severity = classify_severity(final_score)
-        complexity = classify_complexity(final_score, rule_res.get("symptom_count", 0), len(district_reports))
+        complexity = classify_complexity(final_score, rule_res["symptom_count"], len(district_reports))
 
-        # select triggered pest (prefer official, else try logs)
-        triggered = rule_res.get("triggered") or []
-        trigger_pest = None
-        if triggered:
-            trigger_pest = triggered[0]
-        else:
-            # attempt to read pest names in farmer logs
-            for lid, entry in (logs.items() if isinstance(logs, dict) else []):
-                if isinstance(entry, dict) and entry.get("pestDiseaseName"):
-                    m = match_synonym(entry.get("pestDiseaseName"))
-                    if m:
-                        trigger_pest = m
-                        break
+        trigger_pest = rule_res["triggered"][0] if rule_res["triggered"] else "unknown"
 
-        # measures
-        preventive = DEFAULT_PREVENTIVE
-        corrective = DEFAULT_CORRECTIVE
-        if trigger_pest and crop_name.lower() in CROP_DB and trigger_pest in CROP_DB[crop_name.lower()]:
-            pest_info = CROP_DB[crop_name.lower()][trigger_pest]
-            preventive = pest_info.get("preventive", preventive)
-            corrective = pest_info.get("corrective", corrective)
-        else:
-            # if no exact pest, but crop has entries, pick top measures
-            if crop_name.lower() in CROP_DB:
-                # grab first pest's measures
-                for pkey, pval in CROP_DB[crop_name.lower()].items():
-                    preventive = pval.get("preventive", preventive)
-                    corrective = pval.get("corrective", corrective)
-                    break
-        district_breakdown = get_district_breakdown(district, crop_name)
+        preventive, corrective = DEFAULT_PREVENTIVE, DEFAULT_CORRECTIVE
+        crop_db = CROP_DB.get(crop_name.lower(), {})
+        if trigger_pest in crop_db:
+            preventive = crop_db[trigger_pest].get("preventive", preventive)
+            corrective = crop_db[trigger_pest].get("corrective", corrective)
+
+        district_breakdown = get_district_breakdown(district, crop_name) or []
+
         alert = {
             "uid": uid,
             "cropKey": crop_key,
             "cropName": crop_name,
             "timestamp": now_ts_ms(),
-            "riskScore": final_score,
+            "riskScore": round(final_score, 3),
             "severity": severity,
             "complexityLevel": complexity,
-            "triggerPest": trigger_pest or "unknown",
-            "reasons": rule_res.get("reasons", []) + weather_assessment.get("reasons", []),
-            "symptomCount": rule_res.get("symptom_count", 0),
-            "officialReports": len(district_reports),
+            "triggerPest": trigger_pest,
+            "reasons": rule_res["reasons"] + weather_assessment["reasons"],
             "preventiveMeasures": preventive,
             "correctiveMeasures": corrective,
-            "mlProbability": ml_prob,
-            "weatherDelta": weather_assessment.get("delta", 0.0),
             "districtBreakdown": district_breakdown
         }
 
-        #aid = store_alert(uid, alert)
         alerts_created.append(alert)
-    
 
+    # 🔥 DEDUPLICATE ONCE
     final_alerts = deduplicate_by_crop(alerts_created)
-    db.reference(f"alerts/{uid}").delete()    
+
+    # 🔥 CLEAR + STORE ONCE
+    db.reference(f"alerts/{uid}").delete()
+
     stored = []
     for alert in final_alerts:
         aid = store_alert(uid, alert)
         stored.append({**alert, "alertId": aid})
-    return {"status": "ok", "created": alerts_created}
+
+    return {"status": "ok", "created": stored}
 
 @app.get("/alerts/{uid}")
 def get_alerts(uid: str, lang: str = "en"):
@@ -1300,6 +1230,7 @@ def get_alerts(uid: str, lang: str = "en"):
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
 
 
 
