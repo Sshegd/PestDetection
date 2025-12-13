@@ -1248,18 +1248,9 @@ def scan_farmer(uid: str, send_push: bool = True, lang: str = "en"):
             "districtBreakdown": district_breakdown
         }
 
-        aid = store_alert(uid, alert)
+        #aid = store_alert(uid, alert)
         alerts_created.append(alert)
-        
-
-        if severity == "low":
-            outbreak_alert = generate_district_outbreak_alert(
-                uid=uid,
-                crop_name=crop_name,
-                district_reports=district_reports
-        )
-        if outbreak_alert:
-            alerts_created.append(outbreak_alert)
+    
 
     final_alerts = deduplicate_by_crop(alerts_created)
     db.reference(f"alerts/{uid}").delete()    
@@ -1309,5 +1300,6 @@ def get_alerts(uid: str, lang: str = "en"):
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
 
 
