@@ -1,6 +1,5 @@
 # pest_engine.py
 from typing import List, Dict, Optional
-from google_translate import translate_text
 from datetime import datetime
 
 
@@ -159,15 +158,7 @@ class PestEngine:
             preventive = rule.get("preventive", "")
             corrective = rule.get("corrective", "")
 
-            # 4. Translate if needed
-            if lang != "en":
-                try:
-                    pest_name = translate_text(pest_name, lang)
-                    symptoms = translate_text(symptoms, lang)
-                    preventive = translate_text(preventive, lang)
-                    corrective = translate_text(corrective, lang)
-                except:
-                    pass
+            
 
             alerts.append({
                 "cropName": cropName,
@@ -181,3 +172,4 @@ class PestEngine:
             })
 
         return alerts
+
