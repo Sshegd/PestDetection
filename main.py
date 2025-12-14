@@ -1,61 +1,46 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from firebase_init import init_firebase
 from pest_engine import PestEngine
-from firebase_init import init_firebase   # IMPORTANT
-import google.generativeai as genai
+from models import ScanRequest, PestResponse
+from firebase_admin import db
 
+app = FastAPI(title="KrishiSakhi Pest Backend")
 
-app = FastAPI(title="KrishiSakhi Pest Advisory")
-
-# Initialize engine
 engine = PestEngine()
 
 
-# -------------------------
-# STARTUP: Firebase Init
-# -------------------------
 @app.on_event("startup")
-def startup_event():
+def startup():
     init_firebase()
-    print("🚀 Application started successfully")
 
 
-# -------------------------
-# REQUEST MODEL
-# -------------------------
-class PestRequest(BaseModel):
-    crops: list[str]
-    district: str
-    soilType: str
-    language: str = "en"   # ✅ MUST be here
-
-
-# -------------------------
-# HEALTH CHECK
-# -------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-# -------------------------
-# PEST ANALYSIS API
-# -------------------------
-@app.post("/pest/analyse")
-def analyse_pest(req: PestRequest):
-    try:
-        print("📥 Pest request:", req.dict())
+@app.post("/scan/farmer/{uid}")
+def scan_farmer(uid: str, req: ScanRequest):
 
-        alerts = engine.analyse(
-            crops=req.crops,
-            district=req.district,
-            soil=req.soilType,
-            lang=req.language
-        )
+    if not req.district or not req.soilType:
+        raise HTTPException(400, "district & soilType required")
 
-        return {"alerts": alerts}
+    engine.run_scan(
+        uid=uid,
+        district=req.district,
+        soil=req.soilType,
+        lang=req.language
+    )
 
-    except Exception as e:
-        print("❌ Pest analyse error:", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "scan_started"}
 
+
+@app.get("/alerts/{uid}", response_model=PestResponse)
+def get_alerts(uid: str):
+
+    data = db.reference(f"alerts/{uid}").get()
+
+    if not data or "alerts" not in data:
+        return {"alerts": []}
+
+    return data
