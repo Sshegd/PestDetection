@@ -15,7 +15,6 @@ class PestEngine:
 
         alerts = []
 
-        # ---- Example logic (replace with pest_db later) ----
         for crop in crops:
             alerts.append(
                 PestAlert(
@@ -35,7 +34,6 @@ class PestEngine:
                 )
             )
 
-        # Translate if Kannada
         if lang == "kn":
             for a in alerts:
                 a.pestName = translate_to_kannada(a.pestName)
@@ -43,7 +41,6 @@ class PestEngine:
                 a.preventive = [translate_to_kannada(p) for p in a.preventive]
                 a.corrective = [translate_to_kannada(c) for c in a.corrective]
 
-        # Store alerts
         db.reference(f"alerts/{uid}").set({
             "alerts": [a.dict() for a in alerts]
         })
