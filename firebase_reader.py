@@ -1,45 +1,40 @@
 from firebase_admin import db
 
 def get_farmer_context(uid: str):
+    user = db.reference(f"Users/{uid}").get()
 
-    user_ref = db.reference(f"Users/{uid}")
-    user_data = user_ref.get()
-
-    if not user_data:
+    if not user:
         raise ValueError("User not found")
 
     # ✅ DIRECT FIELDS (NO profile)
-    district = user_data.get("district")
-    soil_type = user_data.get("soilType")
+    district = user.get("district")
+    soil = user.get("soilType")
 
-    if not district or not soil_type:
-        raise ValueError("District or soilType missing in user data")
-
-    # ✅ CROPS FROM FARM ACTIVITY LOGS
-    farm_logs = user_data.get("farmActivityLogs", {})
+    if not district or not soil:
+        raise ValueError("District or soilType missing in Users node")
 
     crops = []
 
-    # Primary crop
-    primary = farm_logs.get("primary_crop", {})
-    for _, entry in primary.items():
-        name = entry.get("cropName")
-        if name:
-            crops.append(name.lower())
+    logs = user.get("farmActivityLogs", {})
+
+    # primary crop
+    primary = logs.get("primary_crop", {})
+    for _, v in primary.items():
+        if "cropName" in v:
+            crops.append(v["cropName"].lower())
             break
 
-    # Secondary crops
-    secondary = farm_logs.get("secondary_crop", {})
-    for _, entry in secondary.items():
-        name = entry.get("cropName")
-        if name:
-            crops.append(name.lower())
+    # secondary crops
+    secondary = logs.get("secondary_crop", {})
+    for _, v in secondary.items():
+        if "cropName" in v:
+            crops.append(v["cropName"].lower())
 
     if not crops:
-        raise ValueError("No crops found for user")
+        raise ValueError("No crops found in farmActivityLogs")
 
     return {
         "district": district,
-        "soilType": soil_type,
+        "soilType": soil,
         "crops": list(set(crops))
     }
