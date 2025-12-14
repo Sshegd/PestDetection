@@ -1,34 +1,33 @@
 from firebase_admin import db
+import json
 
 def get_farmer_context(uid: str):
-    user = db.reference(f"Users/{uid}").get()
+
+    ref = db.reference(f"Users/{uid}")
+    user = ref.get()
 
     if not user:
-        raise ValueError("User not found")
+        raise ValueError("User node not found")
 
-    # ✅ DIRECT FIELDS (NO profile)
+    # 🔥 DEBUG: PRINT FULL USER NODE
+    print("🔥 USER DATA:", json.dumps(user, indent=2))
+
     district = user.get("district")
     soil = user.get("soilType")
 
     if not district or not soil:
-        raise ValueError("District or soilType missing in Users node")
-
-    crops = []
+        raise ValueError(
+            f"District or soilType missing. Found district={district}, soilType={soil}"
+        )
 
     logs = user.get("farmActivityLogs", {})
+    crops = []
 
-    # primary crop
-    primary = logs.get("primary_crop", {})
-    for _, v in primary.items():
-        if "cropName" in v:
-            crops.append(v["cropName"].lower())
-            break
-
-    # secondary crops
-    secondary = logs.get("secondary_crop", {})
-    for _, v in secondary.items():
-        if "cropName" in v:
-            crops.append(v["cropName"].lower())
+    for section in ["primary_crop", "secondary_crop"]:
+        for _, v in logs.get(section, {}).items():
+            name = v.get("cropName")
+            if name:
+                crops.append(name.lower())
 
     if not crops:
         raise ValueError("No crops found in farmActivityLogs")
