@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pest_engine import PestEngine
 from firebase_init import init_firebase   # IMPORTANT
+import google.generativeai as genai
+
 
 app = FastAPI(title="KrishiSakhi Pest Advisory")
 
@@ -56,3 +58,4 @@ def analyse_pest(req: PestRequest):
     except Exception as e:
         print("❌ Pest analyse error:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
