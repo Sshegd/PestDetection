@@ -5,5 +5,7 @@ firebase-admin==6.5.0
 
 google-generativeai==0.7.2
 
+# Pydantic v2 works perfectly on Python 3.10
 pydantic==2.6.4
+
 python-dotenv==1.0.1
