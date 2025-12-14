@@ -8,14 +8,13 @@ class PestEngine:
         ctx = get_farmer_context(uid)
 
         alerts = []
-
         for crop in ctx["crops"]:
             alerts.append(
                 PestAlert(
                     cropName=crop,
                     pestName="Brown Planthopper",
                     riskLevel="High",
-                    symptoms=["Yellowing leaves", "Hopper burn"],
+                    symptoms=["Yellowing leaves"],
                     preventive=["Avoid excess nitrogen"],
                     corrective=["Spray Imidacloprid"]
                 )
