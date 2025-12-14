@@ -1,21 +1,22 @@
 from pydantic import BaseModel
-from typing import List
+from typing import Optional
 
 class ScanRequest(BaseModel):
     district: str
     soilType: str
-    primaryCrop: str | None = None
-    secondaryCrop: str | None = None
+    primaryCrop: str
+    secondaryCrop: Optional[str] = None
     language: str = "en"
 
 
 class PestAlert(BaseModel):
-    cropName: str
-    pestName: str
-    riskLevel: str
-    symptoms: List[str]
-    preventive: List[str]
-    corrective: List[str]
+    crop: str
+    pest: str
+    risk: str
+    symptoms: str
+    preventive: str
+    treatment: str
+
 
 class PestResponse(BaseModel):
-    alerts: List[PestAlert]
+    alerts: list[PestAlert]
