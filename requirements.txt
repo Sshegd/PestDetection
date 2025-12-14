@@ -6,3 +6,5 @@ requests
 python-multipart
 joblib
 scikit-learn
+google-generativeai
+
