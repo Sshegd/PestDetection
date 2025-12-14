@@ -1,31 +1,39 @@
+from firebase_reader import get_farmer_context
 from firebase_admin import db
-from gemini_helper import translate_to_kannada
 from models import PestAlert
+from gemini_helper import translate_to_kannada
 
 class PestEngine:
 
-    def run_scan(self, uid: str, district: str, soil: str, lang: str):
+    def run_scan(self, uid: str, lang: str):
 
-        # Example static logic (replace with your real DB logic)
-        alerts = [
-            PestAlert(
-                cropName="paddy",
-                pestName="Brown Planthopper",
-                riskLevel="High",
-                symptoms=[
-                    "Yellowing of leaves",
-                    "Hopper burn patches"
-                ],
-                preventive=[
-                    "Avoid excess nitrogen fertilizer",
-                    "Maintain proper spacing"
-                ],
-                corrective=[
-                    "Spray Imidacloprid",
-                    "Use recommended dosage"
-                ]
+        context = get_farmer_context(uid)
+
+        district = context["district"]
+        soil = context["soilType"]
+        crops = context["crops"]
+
+        alerts = []
+
+        # ---- Example logic (replace with pest_db later) ----
+        for crop in crops:
+            alerts.append(
+                PestAlert(
+                    cropName=crop,
+                    pestName="Brown Planthopper",
+                    riskLevel="High",
+                    symptoms=[
+                        "Yellowing of leaves",
+                        "Hopper burn patches"
+                    ],
+                    preventive=[
+                        "Avoid excess nitrogen fertilizer"
+                    ],
+                    corrective=[
+                        "Spray Imidacloprid as recommended"
+                    ]
+                )
             )
-        ]
 
         # Translate if Kannada
         if lang == "kn":
@@ -35,7 +43,7 @@ class PestEngine:
                 a.preventive = [translate_to_kannada(p) for p in a.preventive]
                 a.corrective = [translate_to_kannada(c) for c in a.corrective]
 
-        # Store in Firebase
+        # Store alerts
         db.reference(f"alerts/{uid}").set({
             "alerts": [a.dict() for a in alerts]
         })
