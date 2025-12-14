@@ -1,6 +1,14 @@
 from pydantic import BaseModel
 from typing import List
 
+class ScanRequest(BaseModel):
+    district: str
+    soilType: str
+    primaryCrop: str | None = None
+    secondaryCrop: str | None = None
+    language: str = "en"
+
+
 class PestAlert(BaseModel):
     cropName: str
     pestName: str
