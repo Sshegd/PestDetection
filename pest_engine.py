@@ -1,39 +1,41 @@
-from translator import translate_to_kannada
+from firebase_admin import db
+from gemini_helper import translate_to_kannada
+from models import PestAlert
 
 class PestEngine:
 
-    def analyse(self, crops, district, soil, lang="en"):
-        results = []
+    def run_scan(self, uid: str, district: str, soil: str, lang: str):
 
-        for crop in crops:
-            crop_l = crop.lower()
+        # Example static logic (replace with your real DB logic)
+        alerts = [
+            PestAlert(
+                cropName="paddy",
+                pestName="Brown Planthopper",
+                riskLevel="High",
+                symptoms=[
+                    "Yellowing of leaves",
+                    "Hopper burn patches"
+                ],
+                preventive=[
+                    "Avoid excess nitrogen fertilizer",
+                    "Maintain proper spacing"
+                ],
+                corrective=[
+                    "Spray Imidacloprid",
+                    "Use recommended dosage"
+                ]
+            )
+        ]
 
-            hist = PEST_HISTORY.get(district.lower(), {}).get(crop_l, {})
-            db = PEST_DB.get(crop_l, {})
+        # Translate if Kannada
+        if lang == "kn":
+            for a in alerts:
+                a.pestName = translate_to_kannada(a.pestName)
+                a.symptoms = [translate_to_kannada(s) for s in a.symptoms]
+                a.preventive = [translate_to_kannada(p) for p in a.preventive]
+                a.corrective = [translate_to_kannada(c) for c in a.corrective]
 
-            for pest, meta in db.items():
-
-                risk = hist.get(pest, {}).get("risk_level", "LOW")
-
-                if soil.lower() in meta.get("soil", []):
-
-                    symptoms = meta["symptoms"]
-                    preventive = meta["preventive"]
-                    treatment = meta["corrective"]
-
-                    # 🌐 AUTO TRANSLATE
-                    if lang == "kn":
-                        symptoms = translate_to_kannada(symptoms)
-                        preventive = translate_to_kannada(preventive)
-                        treatment = translate_to_kannada(treatment)
-
-                    results.append({
-                        "crop": crop,
-                        "pest": pest,
-                        "risk": risk,
-                        "symptoms": symptoms,
-                        "preventive": preventive,
-                        "treatment": treatment
-                    })
-
-        return results
+        # Store in Firebase
+        db.reference(f"alerts/{uid}").set({
+            "alerts": [a.dict() for a in alerts]
+        })
