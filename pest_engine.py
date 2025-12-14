@@ -1,25 +1,19 @@
-from firebase_reader import get_farmer_context
-from firebase_admin import db
-from models import PestAlert
+def run_scan(district, soil, primary, secondary, lang):
 
-class PestEngine:
+    crops = [primary]
+    if secondary:
+        crops.append(secondary)
 
-    def run_scan(self, uid: str, lang: str = "en"):
-        ctx = get_farmer_context(uid)
+    alerts = []
 
-        alerts = []
-        for crop in ctx["crops"]:
-            alerts.append(
-                PestAlert(
-                    cropName=crop,
-                    pestName="Brown Planthopper",
-                    riskLevel="High",
-                    symptoms=["Yellowing leaves"],
-                    preventive=["Avoid excess nitrogen"],
-                    corrective=["Spray Imidacloprid"]
-                )
-            )
-
-        db.reference(f"alerts/{uid}").set({
-            "alerts": [a.dict() for a in alerts]
+    for crop in crops:
+        alerts.append({
+            "crop": crop,
+            "pest": "Root Grub",
+            "risk": "High",
+            "symptoms": "Wilting, yellow leaves",
+            "preventive": "Proper drainage",
+            "treatment": "Chlorpyrifos soil application"
         })
+
+    return alerts
