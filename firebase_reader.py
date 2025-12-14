@@ -1,30 +1,21 @@
 from firebase_admin import db
 
 def get_farmer_context(uid: str):
-    """
-    Reads district, soilType, primary crop and secondary crops
-    from Firebase for the logged-in user.
-    """
 
     user_ref = db.reference(f"Users/{uid}")
     user_data = user_ref.get()
 
     if not user_data:
-        raise ValueError("User not found in Firebase")
+        raise ValueError("User not found")
 
-    # -----------------------
-    # 1️⃣ District & Soil
-    # -----------------------
-    profile = user_data.get("profile", {})
-    district = profile.get("district")
-    soil_type = profile.get("soilType")
+    # ✅ DIRECT FIELDS (NO profile)
+    district = user_data.get("district")
+    soil_type = user_data.get("soilType")
 
     if not district or not soil_type:
-        raise ValueError("District or soilType missing in profile")
+        raise ValueError("District or soilType missing in user data")
 
-    # -----------------------
-    # 2️⃣ Crops (Primary + Secondary)
-    # -----------------------
+    # ✅ CROPS FROM FARM ACTIVITY LOGS
     farm_logs = user_data.get("farmActivityLogs", {})
 
     crops = []
@@ -35,7 +26,7 @@ def get_farmer_context(uid: str):
         name = entry.get("cropName")
         if name:
             crops.append(name.lower())
-            break   # only ONE primary crop
+            break
 
     # Secondary crops
     secondary = farm_logs.get("secondary_crop", {})
@@ -50,5 +41,5 @@ def get_farmer_context(uid: str):
     return {
         "district": district,
         "soilType": soil_type,
-        "crops": list(set(crops))  # remove duplicates
+        "crops": list(set(crops))
     }
