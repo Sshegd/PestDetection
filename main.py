@@ -38,13 +38,17 @@ def scan_farmer(uid: str, req: ScanRequest):
 
 @app.get("/alerts/{uid}")
 def get_alerts(uid: str):
-
     data = db.reference(f"alerts/{uid}").get()
 
-    # 🔒 Always return OBJECT, never string/null
-    if not data or "alerts" not in data:
+    if not data or not isinstance(data, dict):
         return {"alerts": []}
 
-    return data
+    alerts = data.get("alerts", [])
+    if not isinstance(alerts, list):
+        return {"alerts": []}
+
+    return {"alerts": alerts}
+
+
 
 
