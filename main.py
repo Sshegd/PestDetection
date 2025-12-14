@@ -19,27 +19,30 @@ def scan(uid: str):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(400, detail=str(e))
+        
 @app.post("/pest/scan/{uid}")
 def scan_farmer(uid: str, req: ScanRequest):
 
-    if not req.district or not req.soilType:
-        raise HTTPException(
-            status_code=400,
-            detail="District or soilType missing"
-        )
+    if not req.district or not req.soilType or not req.primaryCrop:
+        raise HTTPException(400, "Missing farm data")
 
-    pest_engine.run_scan(
-        uid=uid,
+    alerts = pest_engine.run_scan(
         district=req.district,
-        soil_type=req.soilType,
-        primary_crop=req.primaryCrop,
-        secondary_crop=req.secondaryCrop,
-        language=req.language
+        soil=req.soilType,
+        primary=req.primaryCrop,
+        secondary=req.secondaryCrop,
+        lang=req.language
     )
 
-    return {"status": "scan_started"}
+    db.reference(f"pestAlerts/{uid}").set({
+        "alerts": alerts
+    })
+
+    return {"status": "ok"}
+
 
 @app.get("/alerts/{uid}")
 def alerts(uid: str):
     return db.reference(f"alerts/{uid}").get() or {"alerts": []}
+
 
