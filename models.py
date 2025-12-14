@@ -1,12 +1,6 @@
 from pydantic import BaseModel
 from typing import List
 
-class ScanRequest(BaseModel):
-    district: str
-    soilType: str
-    language: str = "en"
-
-
 class PestAlert(BaseModel):
     cropName: str
     pestName: str
@@ -15,7 +9,5 @@ class PestAlert(BaseModel):
     preventive: List[str]
     corrective: List[str]
 
-
 class PestResponse(BaseModel):
     alerts: List[PestAlert]
-
