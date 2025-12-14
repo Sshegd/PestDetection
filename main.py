@@ -1,36 +1,33 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from firebase_init import init_firebase
 from pest_engine import PestEngine
-from models import ScanRequest
 from firebase_admin import db
 
 app = FastAPI()
 engine = PestEngine()
 
-
 @app.on_event("startup")
 def startup():
     init_firebase()
-
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-
 @app.post("/scan/farmer/{uid}")
-def scan_farmer(uid: str, req: ScanRequest | None = None):
+async def scan_farmer(uid: str, request: Request):
     """
-    Scan farmer pests.
-    Android may send request body OR not.
+    Accept scan request WITH or WITHOUT body.
+    This prevents HTTP 400 permanently.
     """
-
     try:
-        # language priority:
-        # 1️⃣ request body
-        # 2️⃣ Firebase
-        # 3️⃣ default en
-        lang = req.language if req and req.language else "en"
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass  # no body sent
+
+        lang = body.get("language", "en")
 
         engine.run_scan(uid=uid, lang=lang)
 
@@ -38,7 +35,6 @@ def scan_farmer(uid: str, req: ScanRequest | None = None):
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @app.get("/alerts/{uid}")
 def get_alerts(uid: str):
